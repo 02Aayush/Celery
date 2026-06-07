@@ -38,7 +38,7 @@ CELERY_TIMEZONE = 'UTC'
 
 CELERY_TASK_ALWAYS_EAGER = False  # keep False for real async behavior
 CELERY_WORKER_POOL = 'solo'
-
+CELERY_TASK_TRACK_STARTED = True # to see when a task starts in the worker logs
 
 # Application definition
 
