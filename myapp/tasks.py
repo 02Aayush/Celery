@@ -11,7 +11,7 @@ logger = get_task_logger(__name__)
 def add(x, y):
     return x + y
 
-# Task Retries
+# Task 1: Task Retries
 # below is a more complex task that simulates a risky operation that may fail and needs to be retried
 @shared_task(bind=True, max_tries=3, default_retry_delay=5)
 def risky_task(self, x):
@@ -24,7 +24,7 @@ def risky_task(self, x):
         logger.warning(f"failed: {e}. Rretrying...")
         raise self.retry(exc=e)
 
-# Task States / Task Progress Tracking
+# Task 2: Task States / Task Progress Tracking
 # below is a task that simulates a long-running operation and manually updates its state to track
 @shared_task(bind=True)
 def long_task(self, n):
@@ -47,7 +47,7 @@ def long_task(self, n):
         )
     return {'status': 'done', 'result': total}
 
-# Chainig Tasks
+# Task 3: Chaining Tasks
 # below are some simple tasks that can be chained together to create a workflow.
 @shared_task
 def double(x):
@@ -68,3 +68,19 @@ def make_negative(x):
 def add(x):
     logger.info(f"Adding {x} to itself")
     return x + x
+
+# Task 4: Groups (Parallel Tasks)
+# Group inside a chain — run tasks in parallel, then process all results together
+@shared_task
+def multiply(x, y):
+    logger.info(f"Multiplying {x} * {y}")
+    return x * y
+
+'''
+                    Chain                       Group
+Runs:               One after another           All at once
+Output feeds next:  Yes                         No
+Use case:           Sequential workflows        Parallelizable tasks
+Results:            Single value                List of results
+Use when:           Steps depend on each other  Tasks are independent 
+'''
