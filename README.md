@@ -10,7 +10,7 @@ This repo documents the learning path, concepts, code, and how to test everythin
 | Phase | Topic | Status |
 |-------|-------|--------|
 | Phase 1 | Celery Core — tasks, retries, states, chaining, groups | ✅ Done |
-| Phase 2 | Celery Beat — scheduled & periodic tasks | 🔲 In Progress |
+| Phase 2 | Celery Beat — scheduled & periodic tasks | ✅ Done |
 | Phase 3 | Redis Deep Dive — caching, data structures, TTL | 🔲 Planned |
 | Phase 4 | Real World Patterns — progress bars, routing, Flower | 🔲 Planned |
 
@@ -439,4 +439,372 @@ def multiply(x, y):
 
 ---
 
-*Updated as each phase is completed. Phase 2 and beyond coming soon.*
+---
+
+## ✅ Phase 2 — Celery Beat
+
+### Topic 1 — How Beat Works
+
+Beat is a separate scheduler process that drops tasks into the Redis queue on a timer. The worker picks them up exactly like any other task — it has no idea they came from Beat.
+
+```
+Celery Beat                   Redis (broker)                 Celery Worker
+───────────                   ──────────────                 ─────────────
+every 5s: heartbeat() ──────► [ queue: "do heartbeat()" ] ──► runs heartbeat()
+every 1m: cleanup_job() ────► [ queue: "do cleanup_job()" ] ─► runs cleanup_job()
+```
+
+**Two processes, always running together:**
+
+```
+Terminal 1 (WSL)      → redis-server --daemonize yes
+Terminal 2 (Windows)  → celery -A myproject worker -l info --pool=solo
+Terminal 3 (Windows)  → celery -A myproject beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+```
+
+> Beat must be restarted if you add schedules in code (`celery.py`). Schedules added via Django admin are picked up live — no restart needed.
+
+---
+
+### Topic 2 — Install & Setup (django-celery-beat)
+
+`django-celery-beat` stores schedules in the Django database so they survive restarts and can be managed from the admin.
+
+```bash
+pip install django-celery-beat
+python manage.py migrate    # creates Beat's schedule tables
+python manage.py createsuperuser  # needed to access admin
+```
+
+```python
+# settings.py — add to INSTALLED_APPS and point Beat at the DB scheduler
+INSTALLED_APPS = [
+    # ... existing apps ...
+    'django_celery_beat',
+]
+
+CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
+```
+
+| Table created by migration | Purpose |
+|---------------------------|---------|
+| `django_celery_beat_intervalschedule` | Every N seconds/minutes/hours |
+| `django_celery_beat_crontabschedule` | Cron-style schedules |
+| `django_celery_beat_clockedschedule` | Run once at a specific datetime |
+| `django_celery_beat_periodictask` | Links a task to any schedule above |
+
+---
+
+### Topic 3 — Interval Schedules (code-defined)
+
+Define periodic tasks directly in `celery.py` using `add_periodic_task()`. Fires every N seconds.
+
+```python
+# myapp/tasks.py — add these two tasks
+@shared_task
+def heartbeat():
+    logger.info("💓 Heartbeat task fired!")
+    return "alive"
+
+@shared_task
+def cleanup_job():
+    logger.info("🧹 Cleanup job ran")
+    return "cleaned"
+```
+
+```python
+# myproject/celery.py — register schedules at app startup
+import os
+from celery import Celery
+from celery.schedules import crontab
+from myapp.tasks import heartbeat, cleanup_job
+
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'myproject.settings')
+
+app = Celery('myproject')
+app.config_from_object('django.conf:settings', namespace='CELERY')
+app.autodiscover_tasks()
+
+@app.on_after_finalize.connect
+def setup_periodic_tasks(sender, **kwargs):
+    sender.add_periodic_task(5.0,  heartbeat.s(),   name='heartbeat every 5s')
+    sender.add_periodic_task(30.0, cleanup_job.s(), name='cleanup every 30s')
+```
+
+```
+# Worker terminal — what you should see every 5 seconds
+[INFO] Task myapp.tasks.heartbeat[uuid...] received
+[INFO] 💓 Heartbeat task fired!
+[INFO] Task myapp.tasks.heartbeat[uuid...] succeeded in 0.001s: 'alive'
+```
+
+| Parameter | Meaning |
+|-----------|---------|
+| `5.0` | Fire every 5 seconds |
+| `heartbeat.s()` | Signature with no args — Beat calls this on schedule |
+| `name=` | Human-readable label shown in Beat logs and admin |
+| `on_after_finalize.connect` | Hook that runs after all apps are loaded — safe place to register schedules |
+
+---
+
+### Topic 4 — Crontab Schedules (code-defined)
+
+Use `crontab()` for precise timing — same syntax as Unix cron. Minute, hour, day of week, etc.
+
+```python
+# myproject/celery.py — add inside setup_periodic_tasks()
+from celery.schedules import crontab
+
+@app.on_after_finalize.connect
+def setup_periodic_tasks(sender, **kwargs):
+    # every 5 seconds (interval)
+    sender.add_periodic_task(5.0, heartbeat.s(), name='heartbeat every 5s')
+
+    # every minute (crontab)
+    sender.add_periodic_task(
+        crontab(minute='*'),
+        heartbeat.s(),
+        name='heartbeat every minute'
+    )
+
+    # every day at 9:00 AM
+    sender.add_periodic_task(
+        crontab(hour='9', minute='0'),
+        cleanup_job.s(),
+        name='daily cleanup at 9am'
+    )
+```
+
+**Crontab quick reference:**
+
+```
+crontab(minute='*/5')              → every 5 minutes
+crontab(hour='8', minute='0')      → every day at 8:00 AM
+crontab(day_of_week='mon-fri')     → every weekday at midnight
+crontab(minute='0', hour='*/2')    → every 2 hours
+crontab(day_of_month='1')          → 1st of every month at midnight
+crontab(minute='*')                → every minute
+```
+
+| Field | Values | Example |
+|-------|--------|---------|
+| `minute` | `0–59`, `*`, `*/N` | `'*/15'` = every 15 min |
+| `hour` | `0–23`, `*`, `*/N` | `'9'` = 9 AM |
+| `day_of_week` | `0–6`, `mon–sun` | `'mon-fri'` = weekdays |
+| `day_of_month` | `1–31`, `*` | `'1'` = 1st of month |
+| `month_of_year` | `1–12`, `*` | `'*'` = every month |
+
+> `crontab()` with no args fires every minute — same as `* * * * *` in Unix cron.
+
+---
+
+### Topic 5 — Admin-Managed Schedules (django-celery-beat)
+
+Create, pause, and delete schedules from the Django admin without touching code or restarting anything.
+
+```
+http://127.0.0.1:8000/admin/   →   Periodic Tasks section
+```
+
+**Creating an interval task from admin:**
+
+```
+1. Admin → Intervals → Add
+   Every: 10   Period: seconds   → Save
+
+2. Admin → Periodic Tasks → Add
+   Name:      double every 10s
+   Task:      myapp.tasks.double
+   Interval:  (select the one you just made)
+   Arguments: [7]              ← JSON array, becomes double(7)
+   → Save
+```
+
+```
+# Worker terminal — fires every 10 seconds
+[INFO] Task myapp.tasks.double[uuid...] received
+[INFO] Doubling 7
+[INFO] Task myapp.tasks.double[uuid...] succeeded in 0.001s: 14
+```
+
+**Flow — how Beat picks up admin changes:**
+
+```
+Django Admin save
+      │
+      ▼
+django_celery_beat_periodictask (DB row updated)
+      │
+      ▼  (Beat polls DB every few seconds)
+Celery Beat detects change → "DatabaseScheduler: Schedule changed."
+      │
+      ▼
+Task dropped into Redis queue on next interval
+      │
+      ▼
+Worker executes it
+```
+
+| Admin action | Effect | Restart needed? |
+|-------------|--------|----------------|
+| Add new task | Beat picks it up on next poll | ❌ No |
+| Uncheck **Enabled** | Task stops firing immediately | ❌ No |
+| Re-enable | Resumes on next poll | ❌ No |
+| Change interval | New schedule applied live | ❌ No |
+| Delete task | Stops permanently | ❌ No |
+
+> Disabling a runaway task from admin without a deployment is the main operational superpower of `django-celery-beat`.
+
+---
+
+### Topic 6 — Crontab Schedules from Admin
+
+Same as interval but with crontab precision — set exact minute/hour/day combinations from the UI.
+
+```
+1. Admin → Crontabs → Add
+   Minute:        */1
+   Hour:          *
+   Day of week:   *
+   Day of month:  *
+   Month of year: *
+   → Save   (fires every minute)
+
+2. Admin → Periodic Tasks → Add
+   Name:      square every minute
+   Task:      myapp.tasks.square
+   Crontab:   (select the one you just made)
+   Arguments: [4]              ← square(4)
+   → Save
+```
+
+```
+# Worker terminal — fires at the top of every minute
+[INFO] Task myapp.tasks.square[uuid...] received
+[INFO] Squaring 4
+[INFO] Task myapp.tasks.square[uuid...] succeeded in 0.001s: 16
+```
+
+**Daily report pattern — real-world example:**
+
+```
+Crontab:  minute=0, hour=9, everything else *
+Task:     myapp.tasks.cleanup_job
+Name:     daily report at 9am
+```
+
+> The task name in admin must exactly match what `celery inspect registered` returns. A mismatch causes Beat to silently skip it.
+
+---
+
+### Topic 7 — One-off Clocked Tasks
+
+Run a task exactly once at a specific future datetime — then never again.
+
+```
+1. Admin → Clocked → Add
+   Clocked time: 2025-06-15 09:30:00   → Save
+
+2. Admin → Periodic Tasks → Add
+   Name:      one-time cleanup June 15
+   Task:      myapp.tasks.cleanup_job
+   Clocked:   (select the one you just made)
+   ☑ One-off task              ← critical checkbox
+   → Save
+```
+
+**Flow:**
+
+```
+Beat running...
+  → 09:29:59  nothing
+  → 09:30:00  drops cleanup_job() into queue  →  worker executes it
+  → 09:30:05  task marked done, never fires again
+```
+
+| Field | Meaning |
+|-------|---------|
+| **Clocked time** | Exact UTC datetime to fire |
+| **One-off task** ☑ | Task is disabled automatically after it fires once |
+
+> Always use UTC for clocked times unless you've configured Django's `TIME_ZONE` and `USE_TZ` carefully.
+
+---
+
+## 📦 Full Beat config (Phase 2)
+
+### `myproject/celery.py`
+
+```python
+import os
+from celery import Celery
+from celery.schedules import crontab
+
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'myproject.settings')
+
+app = Celery('myproject')
+app.config_from_object('django.conf:settings', namespace='CELERY')
+app.autodiscover_tasks()
+
+@app.on_after_finalize.connect
+def setup_periodic_tasks(sender, **kwargs):
+    from myapp.tasks import heartbeat, cleanup_job
+
+    # Interval — every 5 seconds
+    sender.add_periodic_task(5.0, heartbeat.s(), name='heartbeat every 5s')
+
+    # Interval — every 30 seconds
+    sender.add_periodic_task(30.0, cleanup_job.s(), name='cleanup every 30s')
+
+    # Crontab — every minute
+    sender.add_periodic_task(
+        crontab(minute='*'),
+        heartbeat.s(),
+        name='heartbeat every minute'
+    )
+
+    # Crontab — every day at 9 AM
+    sender.add_periodic_task(
+        crontab(hour='9', minute='0'),
+        cleanup_job.s(),
+        name='daily cleanup at 9am'
+    )
+```
+
+### `settings.py` additions (Phase 2)
+
+```python
+INSTALLED_APPS = [
+    # ... existing ...
+    'django_celery_beat',
+]
+
+CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
+```
+
+### New tasks added to `myapp/tasks.py`
+
+```python
+@shared_task
+def heartbeat():
+    logger.info("💓 Heartbeat task fired!")
+    return "alive"
+
+@shared_task
+def cleanup_job():
+    logger.info("🧹 Cleanup job ran")
+    return "cleaned"
+```
+
+### Start commands (Phase 2 — 3 terminals + admin)
+
+```
+Terminal 1 (WSL)      → redis-server --daemonize yes
+Terminal 2 (Windows)  → celery -A myproject worker -l info --pool=solo
+Terminal 3 (Windows)  → celery -A myproject beat -l info --scheduler django_celery_beat.schedulers:DatabaseScheduler
+Browser               → http://127.0.0.1:8000/admin/  (manage schedules live)
+```
+
+---
+
+*Updated as each phase is completed. Phase 3 (Redis Deep Dive) coming soon.*
