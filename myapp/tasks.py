@@ -11,6 +11,8 @@ logger = get_task_logger(__name__)
 def add(x, y):
     return x + y
 
+# Phase 1: Task Retries, Task States / Task Progress Tracking, Chaining Tasks, Groups (Parallel Tasks)
+
 # Task 1: Task Retries
 # below is a more complex task that simulates a risky operation that may fail and needs to be retried
 @shared_task(bind=True, max_tries=3, default_retry_delay=5)
@@ -84,3 +86,18 @@ Use case:           Sequential workflows        Parallelizable tasks
 Results:            Single value                List of results
 Use when:           Steps depend on each other  Tasks are independent 
 '''
+
+# Phase 2 — Celery Beat (Scheduled Tasks, periodic tasks, crontab schedules) 
+# phase 2 is about scheduling tasks to run at specific intervals or times using Celery Beat. 
+
+# celery beat  →  drops tasks into Redis  →  celery worker picks them up
+
+@shared_task
+def heartbeat():
+    logger.info("Heartbeat task fired!")
+    return "I'm alive!"
+
+@shared_task
+def cleanup_job():
+    logger.info("Cleanup job ran")
+    return "Cleaned"

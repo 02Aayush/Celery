@@ -39,6 +39,8 @@ CELERY_TIMEZONE = 'UTC'
 CELERY_TASK_ALWAYS_EAGER = False  # keep False for real async behavior
 CELERY_WORKER_POOL = 'solo'
 CELERY_TASK_TRACK_STARTED = True # to see when a task starts in the worker logs
+# Tell Beat to store its schedule in the database (not a local file)
+CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
 
 # Application definition
 
@@ -50,6 +52,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'myapp',
+    'django_celery_beat',
 ]
 
 MIDDLEWARE = [
@@ -117,7 +120,8 @@ AUTH_PASSWORD_VALIDATORS = [
 
 LANGUAGE_CODE = 'en-us'
 
-TIME_ZONE = 'UTC'
+# TIME_ZONE = 'UTC'
+TIME_ZONE = 'Asia/Kolkata'   # Change from 'UTC'
 
 USE_I18N = True
 
