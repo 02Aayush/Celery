@@ -66,7 +66,7 @@ def make_negative(x):
     logger.info(f"Making {x} negative")
     return -x
 
-@shared_task
+@shared_task # @shared_task(rate_limit='10/m') This decorator allows you to set a rate limit for the task, in this case, 10 tasks per minute.
 def add(x):
     logger.info(f"Adding {x} to itself")
     return x + x
@@ -101,3 +101,8 @@ def heartbeat():
 def cleanup_job():
     logger.info("Cleanup job ran")
     return "Cleaned"
+
+@shared_task
+def labeled_task(label):
+    logger.info(f"▶ running: {label}")
+    return label

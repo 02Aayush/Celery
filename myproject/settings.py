@@ -47,6 +47,13 @@ CELERY_TASK_ROUTES = {
     'myapp.tasks.cleanup_job': {'queue': 'high_priority'},
     # anything not listed here falls back to the default 'celery' queue
 }
+CELERY_BROKER_TRANSPORT_OPTIONS = {
+    'priority_steps': list(range(10)),   # 0,1,2...9 — one bucket per level
+    'sep': ':',                          # readable subqueue keys: celery:3, celery:9
+    'queue_order_strategy': 'priority',
+}
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1    # ← the magic line. don't hoard tasks.
+CELERY_TASK_ACKS_LATE = True             # ack after finishing, so prefetch=1 actually sticks
 
 # Application definition
 
