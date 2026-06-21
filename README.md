@@ -11,8 +11,8 @@ This repo documents the learning path, concepts, code, and how to test everythin
 |-------|-------|--------|
 | Phase 1 | Celery Core — tasks, retries, states, chaining, groups | ✅ Done |
 | Phase 2 | Celery Beat — scheduled & periodic tasks | ✅ Done |
-| Phase 3 | Redis Deep Dive — caching, data structures, TTL | 🔲 In Progress |
-| Phase 4 | Real World Patterns — progress bars, routing, Flower | 🔲 Planned |
+| Phase 3 | Redis Deep Dive — caching, data structures, TTL | ✅ Done |
+| Phase 4 | Real World Patterns — progress bars, routing, Flower | 🔲 In Progress |
 
 ---
 
@@ -809,7 +809,7 @@ Browser               → http://127.0.0.1:8000/admin/  (manage schedules live)
 
 ---
 
-## 🔲 Phase 3 — Redis Deep Dive
+## ✅ Phase 3 — Redis Deep Dive
 
 ### Topic 1 — Redis Data Structures Celery Actually Uses
 
@@ -1018,20 +1018,230 @@ high_priority: [add(2,3), add(5,5)]   → default_worker: ─ add(2,3) ─ add(5
 
 ---
 
-### Topic 4 — Queue Priorities 🔲 NEXT
+### Topic 4 — Queue Priorities
 
-🔲 Not yet covered — picking up here next session.
+Routing (Topic 3) used **separate queues + separate workers** to keep slow tasks from blocking fast ones. Priorities are different: they reorder tasks **inside one queue**, served by **one worker**, so an urgent task can jump the backlog with no extra worker.
 
-Planned: jumping specific tasks ahead of others *within* the same queue using `priority` in `apply_async()`, without needing separate queues.
+Redis has no native priority queue, so Celery fakes it: it creates one Redis list **per priority level**. The `celery` queue becomes several keys — `celery`, `celery:1`, … `celery:9` — and the worker `BRPOP`s across them in order, draining `celery` (priority 0) first and `celery:9` last.
+
+```python
+# settings.py — REQUIRED for priorities to behave
+CELERY_BROKER_TRANSPORT_OPTIONS = {
+    'priority_steps': list(range(10)),   # 0..9 — one bucket per level
+    'sep': ':',                          # readable subqueue keys: celery:3, celery:9
+    'queue_order_strategy': 'priority',
+}
+
+CELERY_WORKER_PREFETCH_MULTIPLIER = 1    # don't hoard tasks — re-check priority each pull
+CELERY_TASK_ACKS_LATE = True             # ack after finishing, so prefetch=1 actually sticks
+```
+
+```python
+# myapp/tasks.py — a task we can watch in the logs
+@shared_task
+def labeled_task(label):
+    logger.info(f"▶ running: {label}")
+    return label
+```
+
+```python
+# Django shell — load the queue while the worker is STOPPED, then start it
+from myapp.tasks import labeled_task
+
+for i in range(5):
+    labeled_task.apply_async(args=[f"LOW-{i}"], priority=9)
+
+labeled_task.apply_async(args=["🔥 URGENT"], priority=0)   # enqueued LAST
+```
+
+```bash
+# redis-cli — the sep=':' makes the priority sub-queues human-readable
+KEYS celery*
+LLEN celery        # 1  → the priority=0 URGENT task (no suffix = highest)
+LLEN celery:9      # 5  → the priority=9 LOW tasks
+```
+
+```bash
+# Now start the worker — 🔥 URGENT runs FIRST despite being enqueued last
+celery -A myproject worker -l info --pool=solo
+```
+
+```bash
+# Prove the direction yourself: watch where each priority gets LPUSH'd
+# redis-cli
+MONITOR
+```
+
+```python
+# Django shell (while MONITOR runs)
+labeled_task.apply_async(args=["a"], priority=0)   # → LPUSH "celery"
+labeled_task.apply_async(args=["b"], priority=9)   # → LPUSH "celery:9"
+labeled_task.apply_async(args=["c"], priority=5)   # → LPUSH "celery:5"
+```
+
+**Flow — how priority maps to Redis sub-queues:**
+
+```
+apply_async(priority=N)
+        │
+        ▼  Celery picks a sub-queue by N
+   ┌─────────────┬──────────┬──────────┬─── ... ──┬──────────┐
+   │  celery     │ celery:1 │ celery:3 │          │ celery:9 │
+   │ (pri 0)     │          │          │          │          │
+   └─────────────┴──────────┴──────────┴─── ... ──┴──────────┘
+        │             worker BRPOPs left → right
+        ▼
+   drained FIRST ───────────────────────────────► drained LAST
+   (highest priority)                              (lowest priority)
+```
+
+| Concept | Meaning |
+|---|---|
+| `apply_async(args=[...], priority=N)` | Send task with priority N (0–9) |
+| `priority=0` | **Highest** priority on Redis — served first |
+| `priority=9` | **Lowest** priority on Redis — served last |
+| `priority_steps` | Which priority buckets exist; `list(range(10))` = one per level |
+| `sep=':'` | Separator for sub-queue keys → readable `celery:9` in redis-cli |
+| `queue_order_strategy='priority'` | Tells the worker to drain sub-queues in priority order |
+| `worker_prefetch_multiplier=1` | Stops the worker hoarding a batch that priority can't reorder |
+| `task_acks_late=True` | Pairs with prefetch=1 so only one task is held at a time |
+
+> **Redis is BACKWARDS from RabbitMQ.** On Redis, `priority=0` is the *highest* and `9` is the *lowest*. On RabbitMQ it's the reverse (higher number wins). This is the #1 source of "Celery priority doesn't work" confusion — always confirm with `MONITOR` which key gets the `LPUSH`.
+
+> **Priority only reorders tasks already WAITING in Redis.** An idle worker grabs whatever lands first regardless of priority. To see priorities work, a backlog must exist at pull time — that's why the demo loads the queue with the worker stopped.
+
+> **`worker_prefetch_multiplier=1` is mandatory to observe this.** By default the worker prefetches a batch (4) into a local buffer; once buffered, those tasks have left Redis and priority can no longer reorder them. Without this line, priority silently appears to do nothing — even with `--pool=solo`, since prefetch happens at the consumer level before the pool ever sees the task.
+
+> Without any config, Celery still buckets into the default `priority_steps = [0, 3, 6, 9]` (4 levels, separator `\x06\x16`). Setting `list(range(10))` + `sep=':'` just gives you all 10 levels and readable keys.
 
 ---
 
-### Topic 5 — `celery inspect` & Control 🔲 PLANNED
+### Topic 5 — `celery inspect` & Control
 
-🔲 Not yet covered.
+Two command families with one critical difference. `celery inspect` is **read-only** — you ask the worker "what's going on?" and nothing changes. `celery control` **takes action** — revoke, rate-limit, attach a queue, resize the pool. Both broadcast a message over the broker and every listening worker replies, so keep a worker running for all of this.
 
-Planned: deeper live worker interrogation and control — active/reserved/scheduled in more detail, plus revoking and rate-limiting tasks from the command line.
+```bash
+# inspect — read-only worker interrogation (beyond active/reserved/scheduled/ping)
+celery -A myproject inspect registered      # task names this worker knows
+celery -A myproject inspect stats           # pool type, prefetch_count, totals, broker
+celery -A myproject inspect active_queues   # which queues each worker consumes
+celery -A myproject inspect conf            # full effective config
+celery -A myproject inspect query_task <task_id>   # state of specific ID(s)
+celery -A myproject inspect revoked         # task IDs revoked (in worker memory)
+```
+
+```bash
+# handy flags
+celery -A myproject inspect active --json                  # machine-readable
+celery -A myproject inspect ping --timeout 2               # don't hang on dead workers
+celery -A myproject inspect active -d slow_worker@%h       # -d = ask ONE worker only
+```
+
+```bash
+# stats confirms the Topic 4 prefetch fix actually took effect
+celery -A myproject inspect stats
+# → "pool": {"max-concurrency": 1}   ← solo
+# → "prefetch_count": 1              ← proof prefetch_multiplier=1 is live
+```
+
+```bash
+# control revoke — two modes depending on whether the task has STARTED
+celery -A myproject control revoke <task_id>                       # queued/reserved → never runs
+celery -A myproject control revoke <task_id> --terminate           # running → kill the process (SIGTERM)
+celery -A myproject control revoke <task_id> --terminate --signal=SIGKILL   # force-kill
+```
+
+```python
+# Django shell — test revoke against a long task, or revoke from the result object
+from myapp.tasks import long_task
+r = long_task.delay(60)
+print(r.id)
+r.revoke(terminate=True)        # same as the CLI, from Python
+```
+
+```
+# worker log after a revoke
+[WARNING] Task myapp.tasks.long_task[<id>] revoked: terminated
+```
+
+```bash
+# control rate_limit — throttle a task type LIVE, no restart
+celery -A myproject control rate_limit myapp.tasks.add 10/m   # 10 per minute
+celery -A myproject control rate_limit myapp.tasks.add 2/s    # 2 per second
+celery -A myproject control rate_limit myapp.tasks.add 0      # disable
+```
+
+```python
+# Django shell — flood 20, watch the worker meter them out (~1 every 6s at 10/m)
+from myapp.tasks import add
+for i in range(20):
+    add.delay(i, i)
+```
+
+```python
+# static equivalent — baked into the task
+@shared_task(rate_limit='10/m')
+def add(x, y):
+    return x + y
+```
+
+```bash
+# add_consumer / cancel_consumer — the LIVE version of -Q (no restart)
+celery -A myproject control add_consumer high_priority -d default_worker@%h
+celery -A myproject control cancel_consumer high_priority -d default_worker@%h
+celery -A myproject inspect active_queues -d default_worker@%h   # confirm it took
+
+# pool & shutdown (prefork only)
+celery -A myproject control pool_grow 2
+celery -A myproject control pool_shrink 1
+celery -A myproject control shutdown
+```
+
+```python
+# Django shell — every command has an app.control twin
+from myproject.celery import app
+i = app.control.inspect()
+i.active(); i.active_queues(); i.stats()
+app.control.revoke('<task_id>', terminate=True)
+app.control.rate_limit('myapp.tasks.add', '10/m')
+app.control.add_consumer('high_priority', destination=['default_worker@%h'])
+```
+
+**Flow — inspect vs control:**
+
+```
+                   broadcast over broker
+   your CLI / shell ───────────────────────► all workers reply
+        │
+        ├── inspect ──► READ-ONLY  : active, stats, active_queues, registered, conf
+        │
+        └── control ──► TAKES ACTION: revoke, rate_limit, add_consumer,
+                                       pool_grow/shrink, shutdown
+                              │
+                       -d <worker@host> targets ONE worker (omit = all)
+```
+
+| Command | Type | Does |
+|---|---|---|
+| `inspect registered` | read | Task names a worker knows |
+| `inspect stats` | read | Pool type, `prefetch_count`, broker, totals |
+| `inspect active_queues` | read | Which queues each worker consumes (verifies routing) |
+| `inspect query_task <id>` | read | State of a specific task ID across workers |
+| `control revoke <id>` | act | Cancel a **queued/reserved** task — never runs |
+| `control revoke <id> --terminate` | act | Kill a **running** task's process |
+| `control rate_limit <name> 10/m` | act | Throttle a task type live, no restart |
+| `control add_consumer <queue>` | act | Attach a queue to a running worker (live `-Q`) |
+| `control pool_grow / pool_shrink` | act | Resize the worker pool (prefork only) |
+| `-d worker@host` | flag | Target one worker; omit to hit all |
+
+> **`--terminate` needs a prefork pool.** On `--pool=solo` the task runs in the worker's main process — there's no child to kill — so terminating a *running* task isn't cleanly supported. Revoking a *queued/reserved* task (no `--terminate`) works fine on solo. To practice `--terminate`, run a default prefork worker in WSL.
+
+> **Revokes live in worker memory** — if all workers restart, the revoke list is lost and a re-queued task could still run. For durable revokes, start with a state DB: `celery -A myproject worker --statedb=./worker.state`.
+
+> **Rate limits are per-worker, not cluster-wide.** Three workers each at `10/m` = 30/m total. The CLI broadcasts to all, so each gets its own bucket. Rate limiting *does* work on `--pool=solo` (enforced by the consumer's token bucket before the pool runs), so it's safe to test on Windows.
+
+> **`pool_grow` / `pool_shrink` / `autoscale` are prefork-only** — no effect on `--pool=solo`, where concurrency is locked at 1.
 
 ---
 
-*Updated as each phase is completed. Phase 3 in progress — Topics 1–3 done, Topic 4 (queue priorities) next.*
+*Updated as each phase is completed. Phase 3 ✅ complete (Topics 1–5). Phase 4 (real-world patterns) next.*
