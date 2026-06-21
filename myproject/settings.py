@@ -41,6 +41,12 @@ CELERY_WORKER_POOL = 'solo'
 CELERY_TASK_TRACK_STARTED = True # to see when a task starts in the worker logs
 # Tell Beat to store its schedule in the database (not a local file)
 CELERY_BEAT_SCHEDULER = 'django_celery_beat.schedulers:DatabaseScheduler'
+CELERY_TASK_ROUTES = {
+    'myapp.tasks.long_task': {'queue': 'slow_jobs'},
+    'myapp.tasks.heartbeat': {'queue': 'high_priority'},
+    'myapp.tasks.cleanup_job': {'queue': 'high_priority'},
+    # anything not listed here falls back to the default 'celery' queue
+}
 
 # Application definition
 

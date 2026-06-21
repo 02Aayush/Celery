@@ -11,7 +11,7 @@ This repo documents the learning path, concepts, code, and how to test everythin
 |-------|-------|--------|
 | Phase 1 | Celery Core — tasks, retries, states, chaining, groups | ✅ Done |
 | Phase 2 | Celery Beat — scheduled & periodic tasks | ✅ Done |
-| Phase 3 | Redis Deep Dive — caching, data structures, TTL | 🔲 Planned |
+| Phase 3 | Redis Deep Dive — caching, data structures, TTL | 🔲 In Progress |
 | Phase 4 | Real World Patterns — progress bars, routing, Flower | 🔲 Planned |
 
 ---
@@ -807,4 +807,231 @@ Browser               → http://127.0.0.1:8000/admin/  (manage schedules live)
 
 ---
 
-*Updated as each phase is completed. Phase 3 (Redis Deep Dive) coming soon.*
+---
+
+## 🔲 Phase 3 — Redis Deep Dive
+
+### Topic 1 — Redis Data Structures Celery Actually Uses
+
+Celery uses Redis as a plain key-value + list store. `redis-cli` lets you see exactly what gets written when a task fires.
+
+```bash
+# redis-cli
+KEYS *
+```
+
+```
+1) "celery"                          ← the default task queue (a List)
+2) "_kombu.binding.celery"           ← Kombu's queue registry
+3) "celery-task-meta-<uuid>"         ← result of a completed task
+```
+
+```bash
+# redis-cli — watch every command live as a task runs
+MONITOR
+```
+
+```python
+# Django shell — in a separate terminal, fire a task while MONITOR is running
+from myapp.tasks import add
+result = add.delay(2, 3)
+```
+
+```
+# MONITOR output
+"LPUSH" "celery" "<task message JSON>"   ← drops task into the queue list
+"SET" "celery-task-meta-<uuid>" "..."    ← stores result after worker runs it
+```
+
+```bash
+# Inspect the queue and a result directly
+LLEN celery                                  # how many tasks waiting
+LINDEX celery 0                              # peek at the first task (JSON)
+GET celery-task-meta-<uuid>                  # task result + state
+```
+
+```json
+{"status": "SUCCESS", "result": 30, "traceback": null, "task_id": "uuid", ...}
+```
+
+| Redis key pattern | Type | What it stores |
+|---|---|---|
+| `celery` | List | The default task queue — pending tasks |
+| `_kombu.binding.celery` | Set | Kombu's internal queue binding registry |
+| `celery-task-meta-<uuid>` | String | Task result, state, traceback |
+
+> Redis Lists are used as queues: `LPUSH` adds to the left (enqueue), `BRPOP` removes from the right (dequeue). The worker does `BRPOP celery` in a blocking loop, waking instantly when a task arrives.
+
+> If `GET celery-task-meta-<uuid>` returns `(nil)`, it usually means the worker never picked up the task (check `LLEN celery` and worker logs) — not that the result expired. Always confirm with `celery -A myproject inspect ping` that the worker is alive and connected.
+
+---
+
+### Topic 2 — Monitoring Queues & What to Do When They Pile Up
+
+`LLEN` tells you what's waiting. `celery inspect` tells you what the worker is actually doing. Use both together to diagnose a backlog.
+
+```bash
+# redis-cli — the vital sign
+LLEN celery
+```
+
+```
+0    → healthy, nothing waiting
+50   → worker is behind or down
+5000 → something is seriously wrong
+```
+
+```bash
+# Watch it over time
+watch -n 2 redis-cli LLEN celery
+```
+
+```bash
+# Worker's point of view
+celery -A myproject inspect active      # tasks currently executing
+celery -A myproject inspect reserved    # pulled by worker, not started yet
+celery -A myproject inspect scheduled   # waiting on a future ETA/countdown
+celery -A myproject inspect ping        # is the worker alive at all
+```
+
+```python
+# Example: inspect active output
+{
+    'celery@DESKTOP-ABC123': [
+        {'id': '569df05b-...', 'name': 'myapp.tasks.long_task', 'args': [30], 'time_start': 1234567.89}
+    ]
+}
+```
+
+**Flow — diagnosing a pile-up:**
+
+```
+Queue growing because:
+  1. Worker crashed/not running     → restart it
+  2. Worker pool too small          → only 1 task at a time with --pool=solo
+  3. One task type is slow          → blocking everything behind it
+  4. Tasks failing + retrying       → re-queuing endlessly
+```
+
+```bash
+# Clearing a stuck/poisoned queue — DESTRUCTIVE, dev only
+celery -A myproject purge              # asks for confirmation
+redis-cli DEL celery                   # no confirmation, direct
+celery -A myproject control revoke <task_id>   # cancel one specific task
+```
+
+| Command | Tells you / Does |
+|---|---|
+| `redis-cli LLEN celery` | How many tasks are queued, untouched |
+| `inspect active` | What the worker is executing right now |
+| `inspect reserved` | What worker grabbed but hasn't started (prefetch buffer) |
+| `inspect scheduled` | Tasks waiting on a future ETA/countdown |
+| `celery -A myproject purge` | Removes all pending tasks, asks confirmation |
+| `control revoke <task_id>` | Cancels one task by ID, won't run even if picked up |
+
+> With `--pool=solo` (required on Windows), the worker processes one task at a time, sequentially. A single `long_task(60)` blocks everything behind it for 60 seconds — normal in dev, but the reason Topic 3 (routing) exists.
+
+> Never purge in production without checking `inspect active`/`reserved` first — you'll silently lose queued work.
+
+---
+
+### Topic 3 — Multiple Queues & Task Routing
+
+Route specific tasks to specific named queues, then run dedicated workers per queue so slow tasks can't block fast ones.
+
+```python
+# settings.py
+CELERY_TASK_ROUTES = {
+    'myapp.tasks.long_task': {'queue': 'slow_jobs'},
+    'myapp.tasks.heartbeat': {'queue': 'high_priority'},
+    'myapp.tasks.cleanup_job': {'queue': 'high_priority'},
+    # anything not listed here falls back to the default 'celery' queue
+}
+```
+
+```bash
+# Terminal A — handles only slow_jobs
+celery -A myproject worker -l info --pool=solo -Q slow_jobs -n slow_worker@%h
+
+# Terminal B — handles only high_priority
+celery -A myproject worker -l info --pool=solo -Q high_priority -n fast_worker@%h
+
+# Terminal C — handles the default queue
+celery -A myproject worker -l info --pool=solo -Q celery -n default_worker@%h
+```
+
+```python
+# Django shell
+from myapp.tasks import long_task, heartbeat, add
+
+long_task.delay(20)   # → slow_jobs queue → only slow_worker picks it up
+heartbeat.delay()     # → high_priority queue → only fast_worker picks it up
+add.delay(2, 3)       # → default 'celery' queue → only default_worker picks it up
+```
+
+```bash
+# redis-cli — confirm separate queue lists exist
+LLEN slow_jobs
+LLEN high_priority
+LLEN celery
+```
+
+```bash
+# Alternative — one worker, multiple queues, drained left-to-right by priority
+celery -A myproject worker -l info --pool=solo -Q high_priority,celery,slow_jobs
+```
+
+```python
+# Pattern-based routing — CELERY_TASK_ROUTES doesn't support glob patterns,
+# so use a router function for wildcard-style matching
+def route_task(name, args, kwargs, options, task=None, **kw):
+    if name.startswith('myapp.tasks.slow_'):
+        return {'queue': 'slow_jobs'}
+    return {'queue': 'celery'}
+
+CELERY_TASK_ROUTES = (route_task,)
+```
+
+**Flow — before vs after routing:**
+
+```
+BEFORE (single queue):
+celery queue: [long_task(60), add(2,3), add(5,5)]
+worker: ─ long_task ─────────────────────(60s)─ add(2,3) ─ add(5,5)
+                                                  ↑ blocked 60s!
+
+AFTER (routed queues):
+slow_jobs:     [long_task(60)]        → slow_worker:    ─ long_task ──(60s)─
+high_priority: [add(2,3), add(5,5)]   → default_worker: ─ add(2,3) ─ add(5,5) ─
+                                                            ↑ instant, unblocked
+```
+
+| Concept | Meaning |
+|---|---|
+| `CELERY_TASK_ROUTES` | Maps task name → queue name |
+| `-Q queue_name` | Worker flag — only listen to this queue (comma-separate for multiple) |
+| `-n worker_name@%h` | Names the worker (useful when running several at once) |
+| Separate queue per task type | Slow tasks can't block fast tasks anymore |
+| Router function | Use for pattern-based routing instead of exact task names |
+
+> Always restart workers after changing `CELERY_TASK_ROUTES` — routing is read at worker startup, not live like admin-managed Beat schedules.
+
+---
+
+### Topic 4 — Queue Priorities 🔲 NEXT
+
+🔲 Not yet covered — picking up here next session.
+
+Planned: jumping specific tasks ahead of others *within* the same queue using `priority` in `apply_async()`, without needing separate queues.
+
+---
+
+### Topic 5 — `celery inspect` & Control 🔲 PLANNED
+
+🔲 Not yet covered.
+
+Planned: deeper live worker interrogation and control — active/reserved/scheduled in more detail, plus revoking and rate-limiting tasks from the command line.
+
+---
+
+*Updated as each phase is completed. Phase 3 in progress — Topics 1–3 done, Topic 4 (queue priorities) next.*
